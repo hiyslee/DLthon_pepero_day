@@ -6,118 +6,147 @@ import torch
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
-class DLThonDataset(Dataset):
+class DKTCDataset(Dataset):
     """
-    PyTorch Dataset 클래스
-    - 질문과 답변을 [SEP] 토큰으로 연결하여 하나의 시퀀스로 처리
-    - input_ids: 전체 시퀀스 (질문 + [SEP] + 답변)
-    - target_ids: input_ids를 한 칸 뒤로 shift (다음 토큰 예측)
+    Pytorch Dataset class를 상속받아, conversations, label을 모델 학습에 적합한 텐서 형태로 변환하는 클래스
     """
-    def __init__(self, questions, answers, vocab, max_length=120):
-        # 데이터 저장
-        self.vocab = vocab  # SentencePiece vocab 객체
-        self.max_length = max_length  # 최대 시퀀스 길이 (잘림 방지)
-        self.sequences = []
 
-        # 모든 질문 답변 쌍을 시퀀스로 합쳐버리기
-        for q, a in zip(questions, answers):
-            sequence = ([self.vocab.BOS_ID] 
-                        + self.vocab.encode(q) 
-                        + [self.vocab.SEP_ID] 
-                        +  self.vocab.encode(a) 
-                        + [self.vocab.EOS_ID])
-        
+    def __init__(self, conversations, labels, vocab, max_length=400, is_test=False):
+        """
+        Args:
+            conversations
+            labels
+            vocab: SentencePieceVocab 객체
+            max_length: 시퀀스의 최대 길이(tokenization 이후의 길이). default=400
+            is_test: 테스트 데이터셋 여부. default=False
+        """
+        self.vocab = vocab            # SentencePiece vocab 객체
+        self.max_length = max_length  # 최대 시퀀스 길이 (잘림 방지)
+        self.is_test = is_test        # 테스트 데이터 여부
+        self.sequences = []
+        self.labels = labels if not is_test else None
+
+        # conversation -> sequence
+        for conv in conversations:
+            # [CLS] + conversation tokens + [EOS]
+            sequence = [self.vocab.CLS_ID] \
+                        + self.vocab.encode(conv) \
+                        + [self.vocab.EOS_ID]
+
+            # sequence의 길이 조절
             if len(sequence) > max_length:
                 sequence = sequence[:max_length]
-            else: 
+            else:
                 pad_length = max_length - len(sequence)
                 sequence = sequence + [self.vocab.PAD_ID] * pad_length
+
             self.sequences.append(sequence)
 
     def __len__(self):
-        """데이터셋 크기 반환"""
+        """데이터셋에 포함된 총 샘플의 개수 반환"""
         return len(self.sequences)
-
 
     def __getitem__(self, idx):
         """
-    Shifted sequences 반환
-        - input_ids:  [BOS, w1, w2, ..., wN]
-        - target_ids: [w1, w2, ..., wN, EOS]
+        GPT-1 방식: Next-token prediction을 위한 shifted sequences
+        + classification label도 함께 반환
+        
+        Returns:
+            dict: {
+                'input_ids': 모델 입력으로 사용될 텐서 (마지막 토큰 제외),
+                'target_ids': 예측 대상이 되는 텐서 (첫 토큰 제외),
+                'labels': 분류 레이블 (test data인 경우 제외)
+            }
         """
         sequence = self.sequences[idx]
         tokens = torch.tensor(sequence, dtype=torch.long)
-        # Next-token prediction을 위한 shifted sequences
         input_ids = tokens[:-1]   # 마지막 토큰 제외
         target_ids = tokens[1:]   # 첫 토큰 제외
         
-        return {
-            'input_ids': input_ids,    # ← SRC 대신
-            'target_ids': target_ids   # ← TRG 대신
-        }       
+        result = {
+            'input_ids': input_ids,
+            'target_ids': target_ids
+        }
+        
+        # Test가 아닌 경우 레이블 추가
+        if not self.is_test:
+            result["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
+
+        return result
 
 def collate_fn(batch, pad_idx=0):
     """
     DataLoader의 배치 생성 함수
-    목적: 서로 다른 길이의 시퀀스를 같은 길이로 패딩하여 배치 생성
     """
-    # 배치에서 SRC(질문)와 TRG(답변) 분리
     input_batch = [item['input_ids'] for item in batch]
     target_batch = [item['target_ids'] for item in batch]
 
-    # 리스트의 텐서들을 하나의 텐서로 쌓기 (batch_size, seq_len)
-    return {'input_ids': torch.stack(input_batch), 
-            'target_ids': torch.stack(target_batch)}
+    result = {
+        'input_ids': torch.stack(input_batch),
+        'target_ids': torch.stack(target_batch)
+    }
 
-def prepare_dataloader(file_path, vocab_size=1200, max_length=120, batch_size=64):
-    '''
-    데이터를 로드, 전처리, 토큰화하고 PyTorch DataLoader를 생성하는 메인 함수.
-    '''
+    # labels가 있는 경우(즉 Test가 아닌 경우) result에 labels 추가
+    if 'labels' in batch[0]:
+        label_batch = [item['labels'] for item in batch]
+        result['labels'] = torch.stack(label_batch)
+
+    return result
+
+def create_dataloaders(train_path, test_path, vocab_size=1200, max_length=400, batch_size=64):
+    """
+    데이터를 로드, 전처리, 토큰화하고 PyTorch train/test DataLoader를 생성하는 메인 함수.
+    """
     # 1. 데이터 로드 및 전처리
-    questions, answers = load_and_preprocess_data(file_path)
+    train_conversations, \
+    train_labels, \
+    test_conversations, \
+    test_ids, \
+    class_to_idx = load_and_preprocess_data(train_path, test_path)
 
-    # 2. SentencePiece 토크나이저 모델 학습 (경로 수정된 버전 사용)
+    # 2. SentencePiece 토크나이저 모델 학습
     model_prefix = './configs/sentences'
     sp_model_path = train_sentencepiece_model(
-        questions, answers, model_prefix=model_prefix, vocab_size=vocab_size
+        train_conversations, model_prefix=model_prefix, vocab_size=vocab_size
     )
 
     # 3. SentencePiece Vocab 로드
     vocab = SentencePieceVocab(sp_model_path)
 
-    # 4. PyTorch Dataset 생성 (이 파일에 정의된 클래스 사용)
-    dataset = DLThonDataset(questions, answers, vocab, max_length=max_length)
+    # 4. Dataset 생성
+    train_dataset = DKTCDataset(
+        train_conversations,
+        train_labels,
+        vocab,
+        max_length=max_length,
+        is_test=False
+    )
 
-    # 5. PyTorch DataLoader 생성
-    data_loader = DataLoader(
-        dataset,
+    test_dataset = DKTCDataset(
+        test_conversations,
+        labels=None,  # 테스트 데이터에는 레이블이 없습니다.
+        vocab=vocab,
+        max_length=max_length,
+        is_test=True
+    )
+
+    # 5. DataLoader 생성
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(batch, pad_idx=vocab.PAD_ID),
     )
 
-    print(f"\nDataLoader 준비 완료. 총 {len(dataset)}개의 샘플.")
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # 테스트 데이터는 셔플 X
+        collate_fn=lambda batch: collate_fn(batch, pad_idx=vocab.PAD_ID),
+    )
 
-    return data_loader, vocab
+    print(f"\nTrain DataLoader 준비 완료: 총 {len(train_dataset)}개 conversations")
+    print(f"Test DataLoader 준비 완료: 총 {len(test_dataset)}개 conversations.")
 
+    return train_loader, test_loader, vocab
 
-# 스크립트 직접 실행 시 테스트 코드
-if __name__ == '__main__':
-    train_file_path = "./Data/aiffel-dl-thon-dktc-online-15/train.csv"
-
-    # 데이터로더와 vocab 준비 (작은 배치 사이즈로 테스트)
-    train_loader, vocab = prepare_dataloader(train_file_path, batch_size=4)
-
-    # 샘플 배치 확인
-    print("\n--- 샘플 배치 확인 ---")
-    try:
-        sample_batch = next(iter(train_loader))
-        print("Input IDs Shape:", sample_batch['input_ids'].shape)
-        print("Target IDs Shape:", sample_batch['target_ids'].shape)
-        print("\nSample 1 Input (Token IDs):", sample_batch['input_ids'][0])
-        print("Sample 1 Decoded:", vocab.decode(sample_batch['input_ids'][0].tolist()))
-        print("\nSample 1 Target (Token IDs):", sample_batch['target_ids'][0])
-        print("Sample 1 Decoded:", vocab.decode(sample_batch['target_ids'][0].tolist()))
-        print("=" * 25)
-    except StopIteration:
-        print("데이터로더가 비어있습니다. 데이터셋 크기를 확인해주세요.")
